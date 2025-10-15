@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import {Test, Vm} from "forge-std/Test.sol";
+import {Test, Vm, console} from "forge-std/Test.sol";
 import {StdStorage, stdStorage} from "forge-std/StdStorage.sol";
 import {HedgeFund, Queue} from "../src/HedgeFund.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
 contract HedgeFundTest is Test {
     using stdStorage for StdStorage;
 
     uint256 private constant USDT_DECIMALS = 1e6;
     uint256 private constant SHARES_SCALE = 1e12;
+    uint256 private constant PRICE_SCALE = 1e18;
+    uint256 private constant ASSET_TO_18 = 1e12;
+    uint256 private constant MANAGEMENT_FEE_WAD = 2e16;
+    uint256 private constant PERFORMANCE_FEE_WAD = 2e17;
+    uint256 private constant YEAR = 365 days;
 
     IERC20 internal usdt = IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7);
     HedgeFund internal fund;
@@ -185,6 +191,174 @@ contract HedgeFundTest is Test {
 
         (, int256 deltaAfter) = fund.preview(amount);
         assertEq(deltaAfter, int256(amount / 2));
+    }
+
+    function testManagementFeeAccruesOverTime() public {
+        uint256 amount = 100 * USDT_DECIMALS;
+
+        vm.prank(user);
+        fund.deposit(amount);
+
+        vm.prank(owner);
+        fund.contributeEpoch(0);
+
+        vm.prank(user);
+        fund.claim();
+
+        uint256 supply = fund.totalSupply();
+        assertEq(supply, amount * SHARES_SCALE);
+
+        uint256 epochBefore = fund.currentEpoch();
+        uint256 interval = 1 weeks;
+        vm.warp(block.timestamp + interval);
+
+        uint256 tvl = amount;
+        uint256 managementRate = Math.mulDiv(MANAGEMENT_FEE_WAD, interval, YEAR);
+        (
+            uint256 expectedSharePrice,
+            uint256 expectedManagementShares,
+            uint256 expectedManagementValue,
+            uint256 supplyAfterManagement
+        ) = _computeManagementOutcome(supply, tvl, managementRate);
+
+        uint256 nextEpoch = epochBefore + 1;
+        uint256 expectedTimestamp = block.timestamp;
+
+        vm.expectEmit(true, false, false, true, address(fund));
+        emit HedgeFund.EpochContributed(
+            nextEpoch,
+            tvl,
+            expectedSharePrice,
+            expectedTimestamp,
+            0,
+            expectedManagementValue,
+            0,
+            expectedManagementShares,
+            0
+        );
+
+        vm.prank(owner);
+        fund.contributeEpoch(tvl);
+
+        (uint256 sharePriceAfter,) = fund.epochs(fund.currentEpoch());
+        assertEq(fund.currentEpoch(), nextEpoch);
+        assertEq(sharePriceAfter, expectedSharePrice);
+        assertEq(fund.balanceOf(owner), expectedManagementShares);
+        assertEq(fund.totalSupply(), supplyAfterManagement);
+
+        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / SHARES_SCALE;
+        assertApproxEqAbs(investorValue, tvl - expectedManagementValue, 1);
+    }
+
+    function testPerformanceFeeOnProfit() public {
+        uint256 amount = 100 * USDT_DECIMALS;
+
+        vm.prank(user);
+        fund.deposit(amount);
+
+        vm.prank(owner);
+        fund.contributeEpoch(0);
+
+        vm.prank(user);
+        fund.claim();
+
+        uint256 supply = fund.totalSupply();
+        uint256 epochBefore = fund.currentEpoch();
+
+        uint256 tvl = 150 * USDT_DECIMALS;
+        (
+            uint256 expectedSharePrice,
+            uint256 expectedPerformanceShares,
+            uint256 expectedPerformanceValue,
+            uint256 supplyAfterPerformance
+        ) = _computePerformanceOutcome(supply, PRICE_SCALE, tvl);
+
+        uint256 nextEpoch = epochBefore + 1;
+        uint256 expectedTimestamp = block.timestamp;
+
+        vm.expectEmit(true, false, false, true, address(fund));
+        emit HedgeFund.EpochContributed(
+            nextEpoch,
+            tvl,
+            expectedSharePrice,
+            expectedTimestamp,
+            0,
+            0,
+            expectedPerformanceValue,
+            0,
+            expectedPerformanceShares
+        );
+
+        vm.prank(owner);
+        fund.contributeEpoch(tvl);
+
+        (uint256 sharePriceAfter,) = fund.epochs(fund.currentEpoch());
+        assertEq(fund.currentEpoch(), nextEpoch);
+        assertEq(sharePriceAfter, expectedSharePrice);
+        assertEq(fund.balanceOf(owner), expectedPerformanceShares);
+        assertEq(fund.totalSupply(), supplyAfterPerformance);
+
+        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / SHARES_SCALE;
+        assertApproxEqAbs(investorValue, tvl - expectedPerformanceValue, 1);
+    }
+
+    function _computeManagementOutcome(uint256 supply, uint256 tvl, uint256 rate)
+        internal
+        pure
+        returns (uint256 sharePrice, uint256 mintedShares, uint256 mintedValue, uint256 supplyAfter)
+    {
+        if (rate >= PRICE_SCALE) {
+            rate = PRICE_SCALE - 1;
+        }
+
+        sharePrice = Math.mulDiv(tvl * ASSET_TO_18, PRICE_SCALE, supply);
+        mintedShares = 0;
+        supplyAfter = supply;
+
+        if (sharePrice > 0 && rate > 0) {
+            uint256 scaleAfter = PRICE_SCALE - rate;
+            sharePrice = Math.mulDiv(sharePrice, scaleAfter, PRICE_SCALE);
+            mintedShares = Math.mulDiv(supplyAfter, rate, scaleAfter);
+            supplyAfter += mintedShares;
+        }
+
+        mintedValue = _sharesToAssetsTest(mintedShares, sharePrice);
+        return (sharePrice, mintedShares, mintedValue, supplyAfter);
+    }
+
+    function _computePerformanceOutcome(uint256 supply, uint256 baseSharePrice, uint256 tvl)
+        internal
+        pure
+        returns (uint256 sharePrice, uint256 mintedShares, uint256 mintedValue, uint256 supplyAfter)
+    {
+        sharePrice = Math.mulDiv(tvl * ASSET_TO_18, PRICE_SCALE, supply);
+        mintedShares = 0;
+        supplyAfter = supply;
+
+        if (sharePrice > baseSharePrice) {
+            uint256 profitPerShare = sharePrice - baseSharePrice;
+            uint256 feePerShare = Math.mulDiv(profitPerShare, PERFORMANCE_FEE_WAD, PRICE_SCALE);
+
+            if (feePerShare >= sharePrice) {
+                feePerShare = sharePrice == 0 ? 0 : sharePrice - 1;
+            }
+
+            if (feePerShare > 0) {
+                sharePrice -= feePerShare;
+                mintedShares = Math.mulDiv(supplyAfter, feePerShare, sharePrice);
+                supplyAfter += mintedShares;
+            }
+        }
+
+        mintedValue = _sharesToAssetsTest(mintedShares, sharePrice);
+        return (sharePrice, mintedShares, mintedValue, supplyAfter);
+    }
+
+    function _sharesToAssetsTest(uint256 shares, uint256 sharePrice) internal pure returns (uint256) {
+        if (shares == 0 || sharePrice == 0) {
+            return 0;
+        }
+        return Math.mulDiv(shares, sharePrice, PRICE_SCALE * SHARES_SCALE);
     }
 
     function _setBalance(address to, uint256 amount) internal {

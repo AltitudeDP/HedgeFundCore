@@ -44,9 +44,15 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         uint32 timestamp;
     }
 
+    struct FeeBreakdown {
+        uint256 managementAssets;
+        uint256 performanceAssets;
+        uint256 managementShares;
+        uint256 performanceShares;
+    }
+
     error ZeroAmount();
     error ZeroAddress();
-    error InvalidAssetDecimals(uint8 decimals);
 
     event DepositQueue(address indexed user, uint256 indexed tokenId, uint256 amount, uint256 epoch);
     event WithdrawQueue(address indexed user, uint256 indexed tokenId, uint256 shares, uint256 epoch);
@@ -57,10 +63,21 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         address indexed user, uint256 indexed tokenId, uint256 shares, uint256 returnedAmount, uint256 epoch
     );
     event EpochContributed(
-        uint256 indexed epoch, uint256 tvl, uint256 sharePrice, uint256 timestamp, int256 ownerDelta
+        uint256 indexed epoch,
+        uint256 tvl,
+        uint256 sharePrice,
+        uint256 timestamp,
+        int256 ownerDelta,
+        uint256 managementFeeAssets,
+        uint256 performanceFeeAssets,
+        uint256 managementFeeShares,
+        uint256 performanceFeeShares
     );
 
     uint256 private constant PRICE_SCALE = 1e18;
+    uint256 private constant YEAR = 365 days;
+    uint256 private constant MANAGEMENT_FEE_WAD = 2e16; // 2% annualized fee
+    uint256 private constant PERFORMANCE_FEE_WAD = 2e17; // 20% performance fee
     uint256 private immutable ASSET_TO_18 = 1e12;
 
     Queue public immutable QUEUE;
@@ -118,28 +135,89 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     function contributeEpoch(uint256 tvl) external onlyOwner nonReentrant {
         uint256 epochId = currentEpoch + 1;
 
-        (uint256 sharePrice, int256 delta) = _sharePriceAndDelta(tvl);
+        (uint256 sharePrice, int256 delta, FeeBreakdown memory fees) = _sharePriceAndDelta(tvl);
 
         if (delta > 0) {
             ASSET.safeTransferFrom(msg.sender, address(this), uint256(delta));
         } else if (delta < 0) {
             ASSET.safeTransfer(msg.sender, uint256(-delta));
         }
+        if (fees.managementShares != 0 || fees.performanceShares != 0) {
+            _mint(owner(), fees.managementShares + fees.performanceShares);
+        }
 
         epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: uint32(block.timestamp)});
         currentEpoch = epochId;
 
-        emit EpochContributed(epochId, tvl, sharePrice, block.timestamp, delta);
+        emit EpochContributed(
+            epochId,
+            tvl,
+            sharePrice,
+            block.timestamp,
+            delta,
+            fees.managementAssets,
+            fees.performanceAssets,
+            fees.managementShares,
+            fees.performanceShares
+        );
     }
 
     /// @notice Preview owner cashflow before calling contributeEpoch.
     function preview(uint256 tvl) external view returns (uint256 sharePrice, int256 delta) {
-        (sharePrice, delta) = _sharePriceAndDelta(tvl);
+        (sharePrice, delta,) = _sharePriceAndDelta(tvl);
     }
 
-    function _sharePriceAndDelta(uint256 tvl) private view returns (uint256 sharePrice, int256 delta) {
-        uint256 supply = totalSupply();
-        sharePrice = supply == 0 ? PRICE_SCALE : Math.mulDiv(tvl * ASSET_TO_18, PRICE_SCALE, supply);
+    function _sharePriceAndDelta(uint256 tvl)
+        private
+        view
+        returns (uint256 sharePrice, int256 delta, FeeBreakdown memory fees)
+    {
+        uint256 supplyBefore = totalSupply();
+
+        if (supplyBefore == 0) {
+            sharePrice = PRICE_SCALE;
+        } else {
+            Epoch memory prevEpoch = epochs[currentEpoch];
+            uint256 baseSharePrice = prevEpoch.sharePrice == 0 ? PRICE_SCALE : prevEpoch.sharePrice;
+
+            uint256 sharePriceAfter = Math.mulDiv(tvl * ASSET_TO_18, PRICE_SCALE, supplyBefore);
+            uint256 supplyAfter = supplyBefore;
+
+            uint256 managementRate;
+            if (prevEpoch.timestamp != 0) {
+                uint256 dt = block.timestamp - uint256(prevEpoch.timestamp);
+                if (dt != 0) {
+                    managementRate = Math.mulDiv(MANAGEMENT_FEE_WAD, dt, YEAR);
+                    if (managementRate >= PRICE_SCALE) {
+                        managementRate = PRICE_SCALE - 1;
+                    }
+                }
+            }
+
+            if (managementRate != 0 && sharePriceAfter != 0) {
+                uint256 scaleAfter = PRICE_SCALE - managementRate;
+                sharePriceAfter = Math.mulDiv(sharePriceAfter, scaleAfter, PRICE_SCALE);
+                fees.managementShares = Math.mulDiv(supplyAfter, managementRate, scaleAfter);
+                supplyAfter += fees.managementShares;
+            }
+
+            if (sharePriceAfter > baseSharePrice) {
+                uint256 profitPerShare = sharePriceAfter - baseSharePrice;
+                uint256 performanceFeePerShare = Math.mulDiv(profitPerShare, PERFORMANCE_FEE_WAD, PRICE_SCALE);
+
+                if (performanceFeePerShare >= sharePriceAfter) {
+                    performanceFeePerShare = sharePriceAfter == 0 ? 0 : sharePriceAfter - 1;
+                } else if (performanceFeePerShare > 0) {
+                    sharePriceAfter -= performanceFeePerShare;
+                    fees.performanceShares = Math.mulDiv(supplyAfter, performanceFeePerShare, sharePriceAfter);
+                    supplyAfter += fees.performanceShares;
+                }
+            }
+
+            sharePrice = sharePriceAfter;
+            fees.managementAssets = Math.mulDiv(fees.managementShares, sharePrice, PRICE_SCALE * ASSET_TO_18);
+            fees.performanceAssets = Math.mulDiv(fees.performanceShares, sharePrice, PRICE_SCALE * ASSET_TO_18);
+        }
 
         uint256 withdrawValue = pendingWithdraw == 0 || sharePrice == 0
             ? 0
