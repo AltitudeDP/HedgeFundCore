@@ -7,22 +7,7 @@ import {ERC721Enumerable, ERC721} from "openzeppelin-contracts/contracts/token/E
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
-
-/// @dev Enumerable queue controlled by the HedgeFund.
-contract Queue is ERC721Enumerable, Ownable {
-    uint256 private nextId = 1;
-
-    constructor(string memory name, string memory symbol) ERC721(name, symbol) Ownable(msg.sender) {}
-
-    function mint(address to) external onlyOwner returns (uint256 tokenId) {
-        tokenId = nextId++;
-        _safeMint(to, tokenId);
-    }
-
-    function burn(uint256 tokenId) external onlyOwner {
-        _burn(tokenId);
-    }
-}
+import {SafeCast} from "openzeppelin-contracts/contracts/utils/math/SafeCast.sol";
 
 /// @dev Hedge Fund Share token controlling deposits and queued claims.
 contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
@@ -41,7 +26,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
     struct Epoch {
         uint256 sharePrice;
-        uint32 timestamp;
+        uint256 timestamp;
     }
 
     struct FeeBreakdown {
@@ -138,15 +123,17 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         (uint256 sharePrice, int256 delta, FeeBreakdown memory fees) = _sharePriceAndDelta(tvl);
 
         if (delta > 0) {
-            ASSET.safeTransferFrom(msg.sender, address(this), uint256(delta));
+            uint256 deltaPositive = SafeCast.toUint256(delta);
+            ASSET.safeTransferFrom(msg.sender, address(this), deltaPositive);
         } else if (delta < 0) {
-            ASSET.safeTransfer(msg.sender, uint256(-delta));
+            uint256 deltaNegative = SafeCast.toUint256(-delta);
+            ASSET.safeTransfer(msg.sender, deltaNegative);
         }
         if (fees.managementShares != 0 || fees.performanceShares != 0) {
             _mint(owner(), fees.managementShares + fees.performanceShares);
         }
 
-        epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: uint32(block.timestamp)});
+        epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: block.timestamp});
         currentEpoch = epochId;
 
         emit EpochContributed(
@@ -207,7 +194,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
                 if (performanceFeePerShare >= sharePriceAfter) {
                     performanceFeePerShare = sharePriceAfter == 0 ? 0 : sharePriceAfter - 1;
-                } else if (performanceFeePerShare > 0) {
+                } else if (performanceFeePerShare != 0) {
                     sharePriceAfter -= performanceFeePerShare;
                     fees.performanceShares = Math.mulDiv(supplyAfter, performanceFeePerShare, sharePriceAfter);
                     supplyAfter += fees.performanceShares;
@@ -224,7 +211,11 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             : Math.mulDiv(pendingWithdraw, sharePrice, PRICE_SCALE) / ASSET_TO_18;
 
         uint256 balance = ASSET.balanceOf(address(this));
-        delta = withdrawValue >= balance ? int256(withdrawValue - balance) : -int256(balance - withdrawValue);
+        if (withdrawValue >= balance) {
+            delta = SafeCast.toInt256(withdrawValue - balance);
+        } else {
+            delta = -SafeCast.toInt256(balance - withdrawValue);
+        }
     }
 
     function _executeClaim(address account) private {
@@ -292,7 +283,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         delete positions[tokenId];
         QUEUE.burn(tokenId);
 
-        if (returned > 0) {
+        if (returned != 0) {
             ASSET.safeTransfer(account, returned);
         }
 
@@ -304,5 +295,21 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             return false;
         }
         return epochs[epochId].sharePrice != 0;
+    }
+}
+
+/// @dev Enumerable queue controlled by the HedgeFund.
+contract Queue is ERC721Enumerable, Ownable {
+    uint256 private nextId = 1;
+
+    constructor(string memory name, string memory symbol) ERC721(name, symbol) Ownable(msg.sender) {}
+
+    function mint(address to) external onlyOwner returns (uint256 tokenId) {
+        tokenId = nextId++;
+        _safeMint(to, tokenId);
+    }
+
+    function burn(uint256 tokenId) external onlyOwner {
+        _burn(tokenId);
     }
 }

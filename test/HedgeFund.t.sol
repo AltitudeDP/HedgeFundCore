@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.30;
 
-import {Test, Vm, console} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {StdStorage, stdStorage} from "forge-std/StdStorage.sol";
 import {HedgeFund, Queue} from "../src/HedgeFund.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
+import {SafeCast} from "openzeppelin-contracts/contracts/utils/math/SafeCast.sol";
 
 contract HedgeFundTest is Test {
     using stdStorage for StdStorage;
@@ -100,9 +101,11 @@ contract HedgeFundTest is Test {
         uint256 ownerAfter = usdt.balanceOf(owner);
 
         if (deltaPreview > 0) {
-            assertEq(ownerStart - ownerAfter, uint256(deltaPreview));
+            uint256 expectedDelta = SafeCast.toUint256(deltaPreview);
+            assertEq(ownerStart - ownerAfter, expectedDelta);
         } else if (deltaPreview < 0) {
-            assertEq(ownerAfter - ownerStart, uint256(-deltaPreview));
+            uint256 expectedDelta = SafeCast.toUint256(-deltaPreview);
+            assertEq(ownerAfter - ownerStart, expectedDelta);
         } else {
             assertEq(ownerAfter, ownerStart);
         }
@@ -175,7 +178,8 @@ contract HedgeFundTest is Test {
         fund.deposit(amount);
 
         (, int256 deltaBefore) = fund.preview(amount);
-        assertEq(deltaBefore, -int256(amount));
+        int256 expectedNegative = -SafeCast.toInt256(amount);
+        assertEq(deltaBefore, expectedNegative);
 
         vm.prank(owner);
         fund.contributeEpoch(0);
@@ -190,7 +194,8 @@ contract HedgeFundTest is Test {
         fund.withdraw(withdrawShares);
 
         (, int256 deltaAfter) = fund.preview(amount);
-        assertEq(deltaAfter, int256(amount / 2));
+        int256 expectedPositive = SafeCast.toInt256(amount / 2);
+        assertEq(deltaAfter, expectedPositive);
     }
 
     function testManagementFeeAccruesOverTime() public {
