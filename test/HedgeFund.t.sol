@@ -154,8 +154,8 @@ contract HedgeFundTest is Test {
         fund.claim();
 
         Vm.Log[] memory entries = vm.getRecordedLogs();
-        bytes32 depositSig = keccak256("DepositClaimed(address,uint256,uint256,uint256,uint256)");
-        bytes32 withdrawSig = keccak256("WithdrawClaimed(address,uint256,uint256,uint256,uint256)");
+        bytes32 depositSig = keccak256("DepositClaimed(address,uint256,uint256,uint256,uint64)");
+        bytes32 withdrawSig = keccak256("WithdrawClaimed(address,uint256,uint256,uint256,uint64)");
 
         bytes32[] memory order = new bytes32[](2);
         uint256 found;
@@ -213,7 +213,7 @@ contract HedgeFundTest is Test {
         uint256 supply = fund.totalSupply();
         assertEq(supply, amount * SHARES_SCALE);
 
-        uint256 epochBefore = fund.currentEpoch();
+        uint64 epochBefore = fund.currentEpoch();
         uint256 interval = 1 weeks;
         vm.warp(block.timestamp + interval);
 
@@ -226,8 +226,8 @@ contract HedgeFundTest is Test {
             uint256 supplyAfterManagement
         ) = _computeManagementOutcome(supply, tvl, managementRate);
 
-        uint256 nextEpoch = epochBefore + 1;
-        uint256 expectedTimestamp = block.timestamp;
+        uint64 nextEpoch = epochBefore + 1;
+        uint32 expectedTimestamp = uint32(block.timestamp);
 
         vm.expectEmit(true, false, false, true, address(fund));
         emit HedgeFund.EpochContributed(
@@ -268,7 +268,7 @@ contract HedgeFundTest is Test {
         fund.claim();
 
         uint256 supply = fund.totalSupply();
-        uint256 epochBefore = fund.currentEpoch();
+        uint64 epochBefore = fund.currentEpoch();
 
         uint256 tvl = 150 * USDT_DECIMALS;
         (
@@ -278,8 +278,8 @@ contract HedgeFundTest is Test {
             uint256 supplyAfterPerformance
         ) = _computePerformanceOutcome(supply, PRICE_SCALE, tvl);
 
-        uint256 nextEpoch = epochBefore + 1;
-        uint256 expectedTimestamp = block.timestamp;
+        uint64 nextEpoch = epochBefore + 1;
+        uint32 expectedTimestamp = uint32(block.timestamp);
 
         vm.expectEmit(true, false, false, true, address(fund));
         emit HedgeFund.EpochContributed(

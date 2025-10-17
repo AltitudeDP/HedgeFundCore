@@ -21,12 +21,12 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     struct QueuePosition {
         Action action;
         uint256 amount;
-        uint256 epoch;
+        uint64 epoch;
     }
 
     struct Epoch {
         uint256 sharePrice;
-        uint256 timestamp;
+        uint32 timestamp;
     }
 
     struct FeeBreakdown {
@@ -38,20 +38,22 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
     error ZeroAmount();
     error ZeroAddress();
+    error InvalidAmount();
 
-    event DepositQueue(address indexed user, uint256 indexed tokenId, uint256 amount, uint256 epoch);
-    event WithdrawQueue(address indexed user, uint256 indexed tokenId, uint256 shares, uint256 epoch);
+    event DepositQueue(address indexed user, uint256 indexed tokenId, uint256 amount, uint64 epoch);
+    event WithdrawQueue(address indexed user, uint256 indexed tokenId, uint256 shares, uint64 epoch);
     event DepositClaimed(
-        address indexed user, uint256 indexed tokenId, uint256 amount, uint256 mintedShares, uint256 epoch
+        address indexed user, uint256 indexed tokenId, uint256 amount, uint256 mintedShares, uint64 epoch
     );
     event WithdrawClaimed(
-        address indexed user, uint256 indexed tokenId, uint256 shares, uint256 returnedAmount, uint256 epoch
+        address indexed user, uint256 indexed tokenId, uint256 shares, uint256 returnedAmount, uint64 epoch
     );
+    event FeeChanged(uint64 managementFee, uint64 performanceFee);
     event EpochContributed(
-        uint256 indexed epoch,
+        uint64 indexed epoch,
         uint256 tvl,
         uint256 sharePrice,
-        uint256 timestamp,
+        uint32 timestamp,
         int256 ownerDelta,
         uint256 managementFeeAssets,
         uint256 performanceFeeAssets,
@@ -61,19 +63,20 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
     uint256 private constant PRICE_SCALE = 1e18;
     uint256 private constant YEAR = 365 days;
-    uint256 private constant MANAGEMENT_FEE_WAD = 2e16; // 2% annualized fee
-    uint256 private constant PERFORMANCE_FEE_WAD = 2e17; // 20% performance fee
     uint256 private immutable ASSET_TO_18 = 1e12;
 
     Queue public immutable QUEUE;
     IERC20 public immutable ASSET;
 
-    uint256 public currentEpoch;
+    uint64 public managementFeeWad = 2e16; // 2% annualized fee
+    uint64 public performanceFeeWad = 2e17; // 20% performance fee
+    uint64 public currentEpoch;
+
     uint256 public pendingDeposits;
     uint256 public pendingWithdraw;
 
     mapping(uint256 => QueuePosition) public positions;
-    mapping(uint256 => Epoch) public epochs;
+    mapping(uint64 => Epoch) public epochs;
 
     constructor(address _owner, address _asset) ERC20("Altitude Hedge Fund Share", "AHFS") Ownable(_owner) {
         if (_owner == address(0) || _asset == address(0)) revert ZeroAddress();
@@ -84,7 +87,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     /// @notice Queue asset deposit.
     function deposit(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 epochId = currentEpoch + 1;
+        uint64 epochId = currentEpoch + 1;
         _executeClaim(msg.sender);
 
         ASSET.safeTransferFrom(msg.sender, address(this), amount);
@@ -99,7 +102,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     /// @notice Queue share redemption.
     function withdraw(uint256 shares) external nonReentrant {
         if (shares == 0) revert ZeroAmount();
-        uint256 epochId = currentEpoch + 1;
+        uint64 epochId = currentEpoch + 1;
         _executeClaim(msg.sender);
 
         _transfer(msg.sender, address(this), shares);
@@ -116,9 +119,19 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         _executeClaim(msg.sender);
     }
 
+    function setFee(uint64 _managementFeeWad, uint64 _performanceFeeWad) external onlyOwner {
+        if (_managementFeeWad > 2e16 || _performanceFeeWad > 2e17) revert InvalidAmount();
+        if (_managementFeeWad == 0 || _performanceFeeWad == 0) revert ZeroAmount();
+
+        managementFeeWad = _managementFeeWad;
+        performanceFeeWad = _performanceFeeWad;
+
+        emit FeeChanged(_managementFeeWad, _performanceFeeWad);
+    }
+
     /// @notice Close epoch with fresh TVL data.
     function contributeEpoch(uint256 tvl) external onlyOwner nonReentrant {
-        uint256 epochId = currentEpoch + 1;
+        uint64 epochId = currentEpoch + 1;
 
         (uint256 sharePrice, int256 delta, FeeBreakdown memory fees) = _sharePriceAndDelta(tvl);
 
@@ -133,14 +146,14 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             _mint(owner(), fees.managementShares + fees.performanceShares);
         }
 
-        epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: block.timestamp});
+        epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: uint32(block.timestamp)});
         currentEpoch = epochId;
 
         emit EpochContributed(
             epochId,
             tvl,
             sharePrice,
-            block.timestamp,
+            uint32(block.timestamp),
             delta,
             fees.managementAssets,
             fees.performanceAssets,
@@ -174,7 +187,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             if (prevEpoch.timestamp != 0) {
                 uint256 dt = block.timestamp - uint256(prevEpoch.timestamp);
                 if (dt != 0) {
-                    managementRate = Math.mulDiv(MANAGEMENT_FEE_WAD, dt, YEAR);
+                    managementRate = Math.mulDiv(managementFeeWad, dt, YEAR);
                     if (managementRate >= PRICE_SCALE) {
                         managementRate = PRICE_SCALE - 1;
                     }
@@ -190,7 +203,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
             if (sharePriceAfter > baseSharePrice) {
                 uint256 profitPerShare = sharePriceAfter - baseSharePrice;
-                uint256 performanceFeePerShare = Math.mulDiv(profitPerShare, PERFORMANCE_FEE_WAD, PRICE_SCALE);
+                uint256 performanceFeePerShare = Math.mulDiv(profitPerShare, performanceFeeWad, PRICE_SCALE);
 
                 if (performanceFeePerShare >= sharePriceAfter) {
                     performanceFeePerShare = sharePriceAfter == 0 ? 0 : sharePriceAfter - 1;
@@ -290,7 +303,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         emit WithdrawClaimed(account, tokenId, pos.amount, returned, pos.epoch);
     }
 
-    function _isClaimable(uint256 epochId) private view returns (bool) {
+    function _isClaimable(uint64 epochId) private view returns (bool) {
         if (epochId == 0 || epochId > currentEpoch) {
             return false;
         }
