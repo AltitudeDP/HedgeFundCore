@@ -12,11 +12,9 @@ contract HedgeFundTest is Test {
     using stdStorage for StdStorage;
 
     uint256 private constant USDT_DECIMALS = 1e6;
-    uint256 private constant SHARES_SCALE = 1e12;
     uint256 private constant PRICE_SCALE = 1e18;
-    uint256 private constant ASSET_TO_18 = 1e12;
-    uint256 private constant MANAGEMENT_FEE_WAD = 2e16;
-    uint256 private constant PERFORMANCE_FEE_WAD = 2e17;
+    uint64 private constant MANAGEMENT_FEE_WAD = 2e16;
+    uint64 private constant PERFORMANCE_FEE_WAD = 2e17;
     uint256 private constant YEAR = 365 days;
 
     IERC20 internal usdt = IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7);
@@ -26,11 +24,16 @@ contract HedgeFundTest is Test {
     address internal owner = makeAddr("owner");
     address internal user = makeAddr("user");
 
+    uint256 internal assetScale;
+
     function setUp() public {
         vm.createSelectFork(vm.envString("ETH_RPC_URL"), 23_577_777);
 
-        fund = new HedgeFund(owner, address(usdt));
+        fund = new HedgeFund(
+            owner, address(usdt), "Altitude Hedge Fund Share", "AHFS", "Altitude Hedge Fund Queue", "AHFQ"
+        );
         queue = fund.QUEUE();
+        assetScale = fund.ASSET_SCALE();
 
         _setBalance(user, 1000 * USDT_DECIMALS);
         _setBalance(owner, 1000 * USDT_DECIMALS);
@@ -59,7 +62,7 @@ contract HedgeFundTest is Test {
         vm.prank(user);
         fund.claim();
 
-        uint256 expectedShares = amount * SHARES_SCALE;
+        uint256 expectedShares = amount * assetScale;
         assertEq(fund.balanceOf(user), expectedShares);
         assertEq(fund.pendingDeposits(), 0);
         assertEq(queue.balanceOf(user), 0);
@@ -93,7 +96,7 @@ contract HedgeFundTest is Test {
         assertEq(usdt.balanceOf(user), startingBalance - amount);
 
         uint256 ownerStart = usdt.balanceOf(owner);
-        (, int256 deltaPreview) = fund.preview(250 * USDT_DECIMALS);
+        (, int256 deltaPreview,,) = fund.preview(250 * USDT_DECIMALS);
 
         vm.prank(owner);
         fund.contributeEpoch(250 * USDT_DECIMALS);
@@ -115,7 +118,7 @@ contract HedgeFundTest is Test {
 
         (uint256 sharePrice,) = fund.epochs(fund.currentEpoch());
         uint256 value18 = (withdrawShares * sharePrice) / 1e18;
-        uint256 expectedPayout = value18 / SHARES_SCALE;
+        uint256 expectedPayout = value18 / assetScale;
 
         assertEq(usdt.balanceOf(user), startingBalance - amount + expectedPayout);
         assertEq(fund.balanceOf(address(fund)), 0);
@@ -177,7 +180,7 @@ contract HedgeFundTest is Test {
         vm.prank(user);
         fund.deposit(amount);
 
-        (, int256 deltaBefore) = fund.preview(amount);
+        (, int256 deltaBefore,,) = fund.preview(amount);
         int256 expectedNegative = -SafeCast.toInt256(amount);
         assertEq(deltaBefore, expectedNegative);
 
@@ -193,7 +196,7 @@ contract HedgeFundTest is Test {
         vm.prank(user);
         fund.withdraw(withdrawShares);
 
-        (, int256 deltaAfter) = fund.preview(amount);
+        (, int256 deltaAfter,,) = fund.preview(amount);
         int256 expectedPositive = SafeCast.toInt256(amount / 2);
         assertEq(deltaAfter, expectedPositive);
     }
@@ -211,29 +214,31 @@ contract HedgeFundTest is Test {
         fund.claim();
 
         uint256 supply = fund.totalSupply();
-        assertEq(supply, amount * SHARES_SCALE);
+        assertEq(supply, amount * assetScale);
 
         uint64 epochBefore = fund.currentEpoch();
         uint256 interval = 1 weeks;
         vm.warp(block.timestamp + interval);
 
-        uint256 tvl = amount;
+        uint256 nav = amount;
         uint256 managementRate = Math.mulDiv(MANAGEMENT_FEE_WAD, interval, YEAR);
         (
             uint256 expectedSharePrice,
             uint256 expectedManagementShares,
             uint256 expectedManagementValue,
             uint256 supplyAfterManagement
-        ) = _computeManagementOutcome(supply, tvl, managementRate);
+        ) = _computeManagementOutcome(supply, nav, managementRate);
 
         uint64 nextEpoch = epochBefore + 1;
-        uint32 expectedTimestamp = uint32(block.timestamp);
+        uint32 expectedTimestamp = SafeCast.toUint32(block.timestamp);
+        uint256 expectedHighWater = PRICE_SCALE;
 
         vm.expectEmit(true, false, false, true, address(fund));
         emit HedgeFund.EpochContributed(
             nextEpoch,
-            tvl,
+            nav,
             expectedSharePrice,
+            expectedHighWater,
             expectedTimestamp,
             0,
             expectedManagementValue,
@@ -243,7 +248,7 @@ contract HedgeFundTest is Test {
         );
 
         vm.prank(owner);
-        fund.contributeEpoch(tvl);
+        fund.contributeEpoch(nav);
 
         (uint256 sharePriceAfter,) = fund.epochs(fund.currentEpoch());
         assertEq(fund.currentEpoch(), nextEpoch);
@@ -251,8 +256,8 @@ contract HedgeFundTest is Test {
         assertEq(fund.balanceOf(owner), expectedManagementShares);
         assertEq(fund.totalSupply(), supplyAfterManagement);
 
-        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / SHARES_SCALE;
-        assertApproxEqAbs(investorValue, tvl - expectedManagementValue, 1);
+        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / assetScale;
+        assertApproxEqAbs(investorValue, nav - expectedManagementValue, 1);
     }
 
     function testPerformanceFeeOnProfit() public {
@@ -270,22 +275,24 @@ contract HedgeFundTest is Test {
         uint256 supply = fund.totalSupply();
         uint64 epochBefore = fund.currentEpoch();
 
-        uint256 tvl = 150 * USDT_DECIMALS;
+        uint256 nav = 150 * USDT_DECIMALS;
         (
             uint256 expectedSharePrice,
             uint256 expectedPerformanceShares,
             uint256 expectedPerformanceValue,
             uint256 supplyAfterPerformance
-        ) = _computePerformanceOutcome(supply, PRICE_SCALE, tvl);
+        ) = _computePerformanceOutcome(supply, PRICE_SCALE, nav);
 
         uint64 nextEpoch = epochBefore + 1;
-        uint32 expectedTimestamp = uint32(block.timestamp);
+        uint32 expectedTimestamp = SafeCast.toUint32(block.timestamp);
+        uint256 expectedHighWater = expectedSharePrice;
 
         vm.expectEmit(true, false, false, true, address(fund));
         emit HedgeFund.EpochContributed(
             nextEpoch,
-            tvl,
+            nav,
             expectedSharePrice,
+            expectedHighWater,
             expectedTimestamp,
             0,
             0,
@@ -295,7 +302,7 @@ contract HedgeFundTest is Test {
         );
 
         vm.prank(owner);
-        fund.contributeEpoch(tvl);
+        fund.contributeEpoch(nav);
 
         (uint256 sharePriceAfter,) = fund.epochs(fund.currentEpoch());
         assertEq(fund.currentEpoch(), nextEpoch);
@@ -303,20 +310,64 @@ contract HedgeFundTest is Test {
         assertEq(fund.balanceOf(owner), expectedPerformanceShares);
         assertEq(fund.totalSupply(), supplyAfterPerformance);
 
-        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / SHARES_SCALE;
-        assertApproxEqAbs(investorValue, tvl - expectedPerformanceValue, 1);
+        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / assetScale;
+        assertApproxEqAbs(investorValue, nav - expectedPerformanceValue, 1);
     }
 
-    function _computeManagementOutcome(uint256 supply, uint256 tvl, uint256 rate)
+    function testHighWaterMarkGatesPerformanceFee() public {
+        vm.prank(owner);
+        fund.setFees(MANAGEMENT_FEE_WAD, PERFORMANCE_FEE_WAD);
+
+        uint256 amount = 100 * USDT_DECIMALS;
+        vm.prank(user);
+        fund.deposit(amount);
+
+        vm.prank(owner);
+        fund.contributeEpoch(0);
+
+        vm.prank(user);
+        fund.claim();
+
+        assertEq(fund.highWaterMark(), PRICE_SCALE);
+        assertEq(fund.balanceOf(owner), 0);
+
+        vm.prank(owner);
+        fund.contributeEpoch(150 * USDT_DECIMALS);
+
+        uint256 afterFirstProfit = fund.balanceOf(owner);
+        assertGt(afterFirstProfit, 0);
+        uint256 recordedHighWater = fund.highWaterMark();
+        (uint256 sharePriceAfterProfit,) = fund.epochs(fund.currentEpoch());
+        assertEq(recordedHighWater, sharePriceAfterProfit);
+
+        vm.prank(owner);
+        fund.contributeEpoch(120 * USDT_DECIMALS);
+        assertEq(fund.balanceOf(owner), afterFirstProfit);
+        assertEq(fund.highWaterMark(), recordedHighWater);
+
+        vm.prank(owner);
+        fund.contributeEpoch(140 * USDT_DECIMALS);
+        assertEq(fund.balanceOf(owner), afterFirstProfit);
+        assertEq(fund.highWaterMark(), recordedHighWater);
+
+        vm.prank(owner);
+        fund.contributeEpoch(200 * USDT_DECIMALS);
+        uint256 finalShares = fund.balanceOf(owner);
+        assertGt(finalShares, afterFirstProfit);
+        (uint256 latestSharePrice,) = fund.epochs(fund.currentEpoch());
+        assertEq(fund.highWaterMark(), latestSharePrice);
+    }
+
+    function _computeManagementOutcome(uint256 supply, uint256 nav, uint256 rate)
         internal
-        pure
+        view
         returns (uint256 sharePrice, uint256 mintedShares, uint256 mintedValue, uint256 supplyAfter)
     {
         if (rate >= PRICE_SCALE) {
             rate = PRICE_SCALE - 1;
         }
 
-        sharePrice = Math.mulDiv(tvl * ASSET_TO_18, PRICE_SCALE, supply);
+        sharePrice = Math.mulDiv(nav * assetScale, PRICE_SCALE, supply);
         mintedShares = 0;
         supplyAfter = supply;
 
@@ -331,12 +382,12 @@ contract HedgeFundTest is Test {
         return (sharePrice, mintedShares, mintedValue, supplyAfter);
     }
 
-    function _computePerformanceOutcome(uint256 supply, uint256 baseSharePrice, uint256 tvl)
+    function _computePerformanceOutcome(uint256 supply, uint256 baseSharePrice, uint256 nav)
         internal
-        pure
+        view
         returns (uint256 sharePrice, uint256 mintedShares, uint256 mintedValue, uint256 supplyAfter)
     {
-        sharePrice = Math.mulDiv(tvl * ASSET_TO_18, PRICE_SCALE, supply);
+        sharePrice = Math.mulDiv(nav * assetScale, PRICE_SCALE, supply);
         mintedShares = 0;
         supplyAfter = supply;
 
@@ -359,11 +410,11 @@ contract HedgeFundTest is Test {
         return (sharePrice, mintedShares, mintedValue, supplyAfter);
     }
 
-    function _sharesToAssetsTest(uint256 shares, uint256 sharePrice) internal pure returns (uint256) {
+    function _sharesToAssetsTest(uint256 shares, uint256 sharePrice) internal view returns (uint256) {
         if (shares == 0 || sharePrice == 0) {
             return 0;
         }
-        return Math.mulDiv(shares, sharePrice, PRICE_SCALE * SHARES_SCALE);
+        return Math.mulDiv(shares, sharePrice, PRICE_SCALE * assetScale);
     }
 
     function _setBalance(address to, uint256 amount) internal {
