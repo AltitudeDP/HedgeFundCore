@@ -13,6 +13,7 @@ contract HedgeFundTest is Test {
 
     uint256 private constant USDT_DECIMALS = 1e6;
     uint256 private constant PRICE_SCALE = 1e18;
+    uint256 private constant ASSET_SCALE = 1e12;
     uint64 private constant MANAGEMENT_FEE_WAD = 2e16;
     uint64 private constant PERFORMANCE_FEE_WAD = 2e17;
     uint256 private constant YEAR = 365 days;
@@ -24,8 +25,6 @@ contract HedgeFundTest is Test {
     address internal owner = makeAddr("owner");
     address internal user = makeAddr("user");
 
-    uint256 internal assetScale;
-
     function setUp() public {
         vm.createSelectFork(vm.envString("ETH_RPC_URL"), 23_577_777);
 
@@ -33,7 +32,6 @@ contract HedgeFundTest is Test {
             owner, address(usdt), "Altitude Hedge Fund Share", "AHFS", "Altitude Hedge Fund Queue", "AHFQ"
         );
         queue = fund.QUEUE();
-        assetScale = fund.ASSET_SCALE();
 
         _setBalance(user, 1000 * USDT_DECIMALS);
         _setBalance(owner, 1000 * USDT_DECIMALS);
@@ -62,7 +60,7 @@ contract HedgeFundTest is Test {
         vm.prank(user);
         fund.claim();
 
-        uint256 expectedShares = amount * assetScale;
+        uint256 expectedShares = amount * ASSET_SCALE;
         assertEq(fund.balanceOf(user), expectedShares);
         assertEq(fund.pendingDeposits(), 0);
         assertEq(queue.balanceOf(user), 0);
@@ -118,7 +116,7 @@ contract HedgeFundTest is Test {
 
         (uint256 sharePrice,) = fund.epochs(fund.currentEpoch());
         uint256 value18 = (withdrawShares * sharePrice) / 1e18;
-        uint256 expectedPayout = value18 / assetScale;
+        uint256 expectedPayout = value18 / ASSET_SCALE;
 
         assertEq(usdt.balanceOf(user), startingBalance - amount + expectedPayout);
         assertEq(fund.balanceOf(address(fund)), 0);
@@ -214,7 +212,7 @@ contract HedgeFundTest is Test {
         fund.claim();
 
         uint256 supply = fund.totalSupply();
-        assertEq(supply, amount * assetScale);
+        assertEq(supply, amount * ASSET_SCALE);
 
         uint64 epochBefore = fund.currentEpoch();
         uint256 interval = 1 weeks;
@@ -256,7 +254,7 @@ contract HedgeFundTest is Test {
         assertEq(fund.balanceOf(owner), expectedManagementShares);
         assertEq(fund.totalSupply(), supplyAfterManagement);
 
-        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / assetScale;
+        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / ASSET_SCALE;
         assertApproxEqAbs(investorValue, nav - expectedManagementValue, 1);
     }
 
@@ -310,7 +308,7 @@ contract HedgeFundTest is Test {
         assertEq(fund.balanceOf(owner), expectedPerformanceShares);
         assertEq(fund.totalSupply(), supplyAfterPerformance);
 
-        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / assetScale;
+        uint256 investorValue = Math.mulDiv(supply, sharePriceAfter, PRICE_SCALE) / ASSET_SCALE;
         assertApproxEqAbs(investorValue, nav - expectedPerformanceValue, 1);
     }
 
@@ -360,14 +358,14 @@ contract HedgeFundTest is Test {
 
     function _computeManagementOutcome(uint256 supply, uint256 nav, uint256 rate)
         internal
-        view
+        pure
         returns (uint256 sharePrice, uint256 mintedShares, uint256 mintedValue, uint256 supplyAfter)
     {
         if (rate >= PRICE_SCALE) {
             rate = PRICE_SCALE - 1;
         }
 
-        sharePrice = Math.mulDiv(nav * assetScale, PRICE_SCALE, supply);
+        sharePrice = Math.mulDiv(nav * ASSET_SCALE, PRICE_SCALE, supply);
         mintedShares = 0;
         supplyAfter = supply;
 
@@ -384,10 +382,10 @@ contract HedgeFundTest is Test {
 
     function _computePerformanceOutcome(uint256 supply, uint256 baseSharePrice, uint256 nav)
         internal
-        view
+        pure
         returns (uint256 sharePrice, uint256 mintedShares, uint256 mintedValue, uint256 supplyAfter)
     {
-        sharePrice = Math.mulDiv(nav * assetScale, PRICE_SCALE, supply);
+        sharePrice = Math.mulDiv(nav * ASSET_SCALE, PRICE_SCALE, supply);
         mintedShares = 0;
         supplyAfter = supply;
 
@@ -410,11 +408,11 @@ contract HedgeFundTest is Test {
         return (sharePrice, mintedShares, mintedValue, supplyAfter);
     }
 
-    function _sharesToAssetsTest(uint256 shares, uint256 sharePrice) internal view returns (uint256) {
+    function _sharesToAssetsTest(uint256 shares, uint256 sharePrice) internal pure returns (uint256) {
         if (shares == 0 || sharePrice == 0) {
             return 0;
         }
-        return Math.mulDiv(shares, sharePrice, PRICE_SCALE * assetScale);
+        return Math.mulDiv(shares, sharePrice, PRICE_SCALE * ASSET_SCALE);
     }
 
     function _setBalance(address to, uint256 amount) internal {
