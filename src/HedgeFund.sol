@@ -41,6 +41,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     error ZeroAddress();
     error InvalidAssetDecimals(uint8 decimals);
     error FeeTooHigh();
+    error InvalidSharePrice();
 
     event DepositQueued(address indexed user, uint256 indexed tokenId, uint256 assets, uint64 epoch);
     event WithdrawQueued(address indexed user, uint256 indexed tokenId, uint256 shares, uint64 epoch);
@@ -66,6 +67,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
     uint256 private constant PRICE_SCALE = 1e18;
     uint256 private constant YEAR = 365 days;
+    uint256 private constant MAX_MANAGEMENT_INTERVAL = 30 days;
 
     Queue public immutable QUEUE;
     IERC20 public immutable ASSET;
@@ -204,15 +206,15 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         uint256 supplyAfter = supplyBefore;
         uint256 sharePriceAfter =
             supplyBefore == 0 ? PRICE_SCALE : Math.mulDiv(nav, ASSET_SCALE_PRICE_SCALE, supplyBefore);
+        if (sharePriceAfter == 0 && supplyBefore != 0) revert InvalidSharePrice();
 
         if (supplyBefore != 0) {
             Epoch memory prevEpoch = epochs[currentEpoch];
-
-            if (prevEpoch.timestamp != 0 && sharePriceAfter != 0) {
+            if (prevEpoch.timestamp != 0) {
                 uint256 dt = block.timestamp - uint256(prevEpoch.timestamp);
                 if (dt != 0) {
+                    if (dt > MAX_MANAGEMENT_INTERVAL) dt = MAX_MANAGEMENT_INTERVAL;
                     uint256 managementAccrual = Math.mulDiv(managementFeeWad, dt, YEAR);
-                    if (managementAccrual >= PRICE_SCALE) managementAccrual = PRICE_SCALE - 1;
                     uint256 scaleAfter = PRICE_SCALE - managementAccrual;
                     sharePriceAfter = Math.mulDiv(sharePriceAfter, scaleAfter, PRICE_SCALE);
                     uint256 minted = Math.mulDiv(supplyAfter, managementAccrual, scaleAfter);
@@ -235,18 +237,15 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
                 }
             }
 
-            sharePrice = supplyAfter == 0
-                ? PRICE_SCALE
-                : Math.mulDiv(nav, ASSET_SCALE_PRICE_SCALE, supplyAfter);
+            sharePrice = supplyAfter == 0 ? PRICE_SCALE : Math.mulDiv(nav, ASSET_SCALE_PRICE_SCALE, supplyAfter);
             nextHighWaterMark = sharePrice > previousHighWaterMark ? sharePrice : previousHighWaterMark;
         } else {
             sharePrice = PRICE_SCALE;
-            nextHighWaterMark = previousHighWaterMark > PRICE_SCALE ? previousHighWaterMark : PRICE_SCALE;
+            nextHighWaterMark = PRICE_SCALE;
         }
 
-        uint256 withdrawValue = pendingWithdraw == 0 || sharePrice == 0
-            ? 0
-            : Math.mulDiv(pendingWithdraw, sharePrice, ASSET_SCALE_PRICE_SCALE);
+        uint256 withdrawValue =
+            pendingWithdraw == 0 ? 0 : Math.mulDiv(pendingWithdraw, sharePrice, ASSET_SCALE_PRICE_SCALE);
 
         uint256 balance = ASSET.balanceOf(address(this));
         if (withdrawValue >= balance) {
@@ -263,7 +262,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         for (uint256 i = balance; i != 0; i--) {
             uint256 tokenId = QUEUE.tokenOfOwnerByIndex(account, i - 1);
             QueuePosition memory pos = positions[tokenId];
-            if (!_isClaimable(pos.epoch)) continue;
+            if (epochs[pos.epoch].sharePrice == 0) continue;
             if (pos.action == Action.Deposit) {
                 _settleDeposit(account, tokenId);
             } else {
@@ -301,9 +300,5 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             ASSET.safeTransfer(account, returned);
         }
         emit WithdrawClaimed(account, tokenId, pos.amount, returned, pos.epoch);
-    }
-
-    function _isClaimable(uint64 epochId) private view returns (bool) {
-        return epochId != 0 && epochId <= currentEpoch && epochs[epochId].sharePrice != 0;
     }
 }
