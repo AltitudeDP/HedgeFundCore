@@ -9,7 +9,7 @@ Key mechanics:
 - **Management fee**: accrues continuously at `managementFeeWad` (default 2% yearly).
 - **Performance fee**: charged only when the share price exceeds the stored High-Water mark. Profit above HWM is skimmed at `performanceFeeWad` (default 20% yearly). High-water mark updates on new net highs.
 - **High-water mark**: persists through drawdowns; performance fees resume only after the previous peak NAV is surpassed.
-- **Owner**: Safe Multisig of Altitude Hedge Fund. contributeEpoch uses Safe Multisig to indicate the current Net Asset Value.
+- **Owner**: Safe Multisig of Altitude Hedge Fund. contributeEpoch uses Safe Multisig to indicate the current Net Asset Value. Altitude Hedge Fund invests in a variety of strategies, strategies may change frequently, NAV is considered off-chain.
 
 Fee math uses pure WAD formulas, avoiding loops or redundant transfers, and works with any asset up to 18 decimals (scaling is derived at deployment).
 
