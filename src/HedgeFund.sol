@@ -6,12 +6,13 @@ import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 import {IERC20, IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
-import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "openzeppelin-contracts/contracts/utils/ReentrancyGuardTransient.sol";
 import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import {SafeCast} from "openzeppelin-contracts/contracts/utils/math/SafeCast.sol";
+import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
 
 /// @title Altitude Hedge Fund
-contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
+contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     enum Action {
@@ -20,9 +21,9 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     }
 
     struct QueuePosition {
-        Action action;
         uint256 amount;
         uint64 epoch;
+        Action action;
     }
 
     struct Epoch {
@@ -67,11 +68,11 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
     uint256 private constant PRICE_SCALE = 1e18;
     uint256 private constant YEAR = 365 days;
-    uint256 private constant MAX_MANAGEMENT_INTERVAL = 30 days;
+    uint256 private constant MAX_MANAGEMENT_INTERVAL = 365 days;
+    uint256 private immutable ASSET_SCALE_PRICE_SCALE;
 
     Queue public immutable QUEUE;
     IERC20 public immutable ASSET;
-    uint256 public immutable ASSET_SCALE_PRICE_SCALE;
 
     uint64 public currentEpoch;
     uint64 public managementFeeWad;
@@ -80,9 +81,11 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
     uint256 public highWaterMark;
     uint256 public pendingDeposits;
     uint256 public pendingWithdraw;
+    uint256 public withdrawReserveAssets;
 
     mapping(uint256 => QueuePosition) public positions;
     mapping(uint64 => Epoch) public epochs;
+    mapping(uint64 => uint256) private epochWithdrawShares;
 
     constructor(
         address owner_,
@@ -117,8 +120,18 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         emit FeesUpdated(managementFeeWad_, performanceFeeWad_);
     }
 
+    /// @notice Owner may pause new deposits.
+    function pauseDeposits() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Owner resumes deposits.
+    function unpauseDeposits() external onlyOwner {
+        _unpause();
+    }
+
     /// @notice Queue an asset deposit.
-    function deposit(uint256 assets) external nonReentrant {
+    function deposit(uint256 assets) external nonReentrant whenNotPaused {
         if (assets == 0) revert ZeroAmount();
         uint64 epochId = currentEpoch + 1;
         _executeClaim(msg.sender);
@@ -126,7 +139,7 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         ASSET.safeTransferFrom(msg.sender, address(this), assets);
         uint256 tokenId = QUEUE.mint(msg.sender);
 
-        positions[tokenId] = QueuePosition({action: Action.Deposit, amount: assets, epoch: epochId});
+        positions[tokenId] = QueuePosition({amount: assets, epoch: epochId, action: Action.Deposit});
         pendingDeposits += assets;
 
         emit DepositQueued(msg.sender, tokenId, assets, epochId);
@@ -141,15 +154,16 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         _transfer(msg.sender, address(this), shares);
         uint256 tokenId = QUEUE.mint(msg.sender);
 
-        positions[tokenId] = QueuePosition({action: Action.Withdraw, amount: shares, epoch: epochId});
+        positions[tokenId] = QueuePosition({amount: shares, epoch: epochId, action: Action.Withdraw});
         pendingWithdraw += shares;
+        epochWithdrawShares[epochId] += shares;
 
         emit WithdrawQueued(msg.sender, tokenId, shares, epochId);
     }
 
     /// @notice Claim every matured queue position.
-    function claim() external nonReentrant {
-        _executeClaim(msg.sender);
+    function claim() external nonReentrant returns (uint256 shares, uint256 assets) {
+        (shares, assets) = _executeClaim(msg.sender);
     }
 
     /// @notice Preview share price, owner cashflow and the next high-water mark.
@@ -175,12 +189,13 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
 
         uint256 ownerShares = fees.managementShares + fees.performanceShares;
         if (ownerShares != 0) {
-            _mint(owner(), ownerShares);
+            _mint(msg.sender, ownerShares);
         }
 
         epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: SafeCast.toUint32(block.timestamp)});
         currentEpoch = epochId;
         highWaterMark = nextHighWaterMark;
+        _matureWithdrawals(epochId, sharePrice);
 
         emit EpochContributed(
             epochId,
@@ -227,7 +242,6 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             if (sharePriceAfter > previousHighWaterMark) {
                 uint256 profitAbove = sharePriceAfter - previousHighWaterMark;
                 uint256 feePerShare = Math.mulDiv(profitAbove, performanceFeeWad, PRICE_SCALE);
-                if (feePerShare >= sharePriceAfter) feePerShare = sharePriceAfter - 1;
                 if (feePerShare != 0) {
                     sharePriceAfter -= feePerShare;
                     uint256 minted = Math.mulDiv(supplyAfter, feePerShare, sharePriceAfter);
@@ -244,8 +258,10 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
             nextHighWaterMark = PRICE_SCALE;
         }
 
-        uint256 withdrawValue =
-            pendingWithdraw == 0 ? 0 : Math.mulDiv(pendingWithdraw, sharePrice, ASSET_SCALE_PRICE_SCALE);
+        uint256 sharesQueuedNext = epochWithdrawShares[currentEpoch + 1];
+        uint256 outstandingSharesValue =
+            sharesQueuedNext == 0 ? 0 : Math.mulDiv(sharesQueuedNext, sharePrice, ASSET_SCALE_PRICE_SCALE);
+        uint256 withdrawValue = outstandingSharesValue + withdrawReserveAssets;
 
         uint256 balance = ASSET.balanceOf(address(this));
         if (withdrawValue >= balance) {
@@ -255,50 +271,61 @@ contract HedgeFund is ERC20, Ownable, ReentrancyGuard {
         }
     }
 
-    function _executeClaim(address account) private {
+    function _matureWithdrawals(uint64 epochId, uint256 sharePrice) private {
+        uint256 sharesForEpoch = epochWithdrawShares[epochId];
+        if (sharesForEpoch == 0) return;
+
+        epochWithdrawShares[epochId] = 0;
+        pendingWithdraw -= sharesForEpoch;
+
+        uint256 assetsOwed = Math.mulDiv(sharesForEpoch, sharePrice, ASSET_SCALE_PRICE_SCALE);
+        withdrawReserveAssets += assetsOwed;
+    }
+
+    function _executeClaim(address account) private returns (uint256 shares, uint256 assets) {
         uint256 balance = QUEUE.balanceOf(account);
-        if (balance == 0) return;
+        if (balance == 0) return (0, 0);
 
         for (uint256 i = balance; i != 0; i--) {
             uint256 tokenId = QUEUE.tokenOfOwnerByIndex(account, i - 1);
             QueuePosition memory pos = positions[tokenId];
             if (epochs[pos.epoch].sharePrice == 0) continue;
             if (pos.action == Action.Deposit) {
-                _settleDeposit(account, tokenId);
+                shares += _settleDeposit(account, tokenId);
             } else {
-                _settleWithdraw(account, tokenId);
+                assets += _settleWithdraw(account, tokenId);
             }
         }
     }
 
-    function _settleDeposit(address account, uint256 tokenId) private {
+    function _settleDeposit(address account, uint256 tokenId) private returns (uint256 shares) {
         QueuePosition memory pos = positions[tokenId];
         Epoch memory epoch = epochs[pos.epoch];
 
-        uint256 mintedShares = Math.mulDiv(pos.amount, ASSET_SCALE_PRICE_SCALE, epoch.sharePrice);
+        shares = Math.mulDiv(pos.amount, ASSET_SCALE_PRICE_SCALE, epoch.sharePrice);
 
         pendingDeposits -= pos.amount;
         delete positions[tokenId];
         QUEUE.burn(tokenId);
 
-        _mint(account, mintedShares);
-        emit DepositClaimed(account, tokenId, pos.amount, mintedShares, pos.epoch);
+        _mint(account, shares);
+        emit DepositClaimed(account, tokenId, pos.amount, shares, pos.epoch);
     }
 
-    function _settleWithdraw(address account, uint256 tokenId) private {
+    function _settleWithdraw(address account, uint256 tokenId) private returns (uint256 assets) {
         QueuePosition memory pos = positions[tokenId];
         Epoch memory epoch = epochs[pos.epoch];
 
-        uint256 returned = Math.mulDiv(pos.amount, epoch.sharePrice, ASSET_SCALE_PRICE_SCALE);
+        assets = Math.mulDiv(pos.amount, epoch.sharePrice, ASSET_SCALE_PRICE_SCALE);
 
         _burn(address(this), pos.amount);
-        pendingWithdraw -= pos.amount;
         delete positions[tokenId];
         QUEUE.burn(tokenId);
 
-        if (returned != 0) {
-            ASSET.safeTransfer(account, returned);
+        if (assets != 0) {
+            withdrawReserveAssets -= assets;
+            ASSET.safeTransfer(account, assets);
         }
-        emit WithdrawClaimed(account, tokenId, pos.amount, returned, pos.epoch);
+        emit WithdrawClaimed(account, tokenId, pos.amount, assets, pos.epoch);
     }
 }
