@@ -85,7 +85,6 @@ contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
 
     mapping(uint256 => QueuePosition) public positions;
     mapping(uint64 => Epoch) public epochs;
-    mapping(uint64 => uint256) private epochWithdrawShares;
 
     constructor(
         address owner_,
@@ -156,7 +155,6 @@ contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
 
         positions[tokenId] = QueuePosition({amount: shares, epoch: epochId, action: Action.Withdraw});
         pendingWithdraw += shares;
-        epochWithdrawShares[epochId] += shares;
 
         emit WithdrawQueued(msg.sender, tokenId, shares, epochId);
     }
@@ -195,7 +193,8 @@ contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
         epochs[epochId] = Epoch({sharePrice: sharePrice, timestamp: SafeCast.toUint32(block.timestamp)});
         currentEpoch = epochId;
         highWaterMark = nextHighWaterMark;
-        _matureWithdrawals(epochId, sharePrice);
+        withdrawReserveAssets += Math.mulDiv(pendingWithdraw, sharePrice, ASSET_SCALE_PRICE_SCALE);
+        pendingWithdraw = 0;
 
         emit EpochContributed(
             epochId,
@@ -258,10 +257,9 @@ contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
             nextHighWaterMark = PRICE_SCALE;
         }
 
-        uint256 sharesQueuedNext = epochWithdrawShares[currentEpoch + 1];
-        uint256 outstandingSharesValue =
-            sharesQueuedNext == 0 ? 0 : Math.mulDiv(sharesQueuedNext, sharePrice, ASSET_SCALE_PRICE_SCALE);
-        uint256 withdrawValue = outstandingSharesValue + withdrawReserveAssets;
+        uint256 sharesValue =
+            pendingWithdraw == 0 ? 0 : Math.mulDiv(pendingWithdraw, sharePrice, ASSET_SCALE_PRICE_SCALE);
+        uint256 withdrawValue = sharesValue + withdrawReserveAssets;
 
         uint256 balance = ASSET.balanceOf(address(this));
         if (withdrawValue >= balance) {
@@ -269,17 +267,6 @@ contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
         } else {
             delta = -SafeCast.toInt256(balance - withdrawValue);
         }
-    }
-
-    function _matureWithdrawals(uint64 epochId, uint256 sharePrice) private {
-        uint256 sharesForEpoch = epochWithdrawShares[epochId];
-        if (sharesForEpoch == 0) return;
-
-        epochWithdrawShares[epochId] = 0;
-        pendingWithdraw -= sharesForEpoch;
-
-        uint256 assetsOwed = Math.mulDiv(sharesForEpoch, sharePrice, ASSET_SCALE_PRICE_SCALE);
-        withdrawReserveAssets += assetsOwed;
     }
 
     function _executeClaim(address account) private returns (uint256 shares, uint256 assets) {
