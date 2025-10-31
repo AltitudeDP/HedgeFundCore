@@ -305,14 +305,12 @@ contract HedgeFund is ERC20, Ownable, Pausable, ReentrancyGuardTransient {
 
         assets = Math.mulDiv(pos.amount, epoch.sharePrice, ASSET_SCALE_PRICE_SCALE);
 
+        withdrawReserveAssets -= assets;
         _burn(address(this), pos.amount);
         delete positions[tokenId];
         QUEUE.burn(tokenId);
 
-        if (assets != 0) {
-            withdrawReserveAssets -= assets;
-            ASSET.safeTransfer(account, assets);
-        }
+        ASSET.safeTransfer(account, assets);
         emit WithdrawClaimed(account, tokenId, pos.amount, assets, pos.epoch);
     }
 }
